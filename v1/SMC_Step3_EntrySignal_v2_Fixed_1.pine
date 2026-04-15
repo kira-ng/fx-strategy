@@ -1,0 +1,791 @@
+// This Pine Script™ source code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © SMC Strategy - Step 3: Trigger Entry Signal (v2 - Fixed Sweep Detection)
+//
+// Step 1: Cấu trúc thị trường ✅
+// Step 2: Trade Quality (Discount/Premium) ✅
+// Step 3: Entry Signal v2 - FIXED ← Dùng LOW/HIGH để bắt sweep
+//
+// Entry Rules:
+// BUY:
+//  1. Trend Bullish
+//  2. Giá ĐÃ VÀO vùng Discount (dùng LOW để detect sweep)
+//  3. CHỈ LẤY NẾN XÁC NHẬN ĐẦU TIÊN sau khi vào Discount
+//  4. Nếu nến đó không đủ điều kiện (Close <= EMA200) → BỎ QUA setup sóng này
+//  5. Trigger lần 2: Phải có đáy mới THẤP HƠN predicted low (sweep)
+//
+// SELL: Tương tự ngược lại
+
+//@version=6
+indicator("SMC Step 3 - Entry v2 (Fixed)", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=100)
+
+// ══════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════
+grp_struct = "═══ CẤU TRÚC THỊ TRƯỜNG ═══"
+swingLen      = input.int(5, "Swing Length", minval=2, maxval=20, group=grp_struct)
+showSwingHL   = input.bool(true, "Hiện Swing High / Low", group=grp_struct)
+showBosChoch  = input.bool(true, "Hiện BoS / ChoCh", group=grp_struct)
+showConfirm   = input.bool(true, "Hiện nến xác nhận", group=grp_struct)
+showLevels    = input.bool(true, "Hiện đường chờ phá vỡ", group=grp_struct)
+
+grp_ema = "═══ EMA ═══"
+emaLen       = input.int(200, "EMA Length", minval=50, maxval=500, group=grp_ema)
+emaColor     = input.color(color.new(#9c9c9c, 0), "Màu EMA", group=grp_ema)
+
+grp_quality = "═══ TRADE QUALITY ═══"
+showFibZone   = input.bool(true, "Hiện vùng Discount/Premium", group=grp_quality)
+fibThreshold  = input.float(50.0, "Ngưỡng % (Discount/Premium)", minval=0, maxval=100, step=5, group=grp_quality)
+showEQ        = input.bool(true, "Hiện đường Equilibrium (50%)", group=grp_quality)
+
+grp_entry = "═══ ENTRY SIGNAL ═══"
+showEntrySignal = input.bool(true, "Hiện tín hiệu Entry", group=grp_entry)
+enableAlerts    = input.bool(true, "Bật Alert", group=grp_entry)
+
+grp_color = "═══ MÀU SẮC ═══"
+colorSH        = input.color(color.new(#089981, 0), "Swing High", group=grp_color)
+colorSL        = input.color(color.new(#F23645, 0), "Swing Low", group=grp_color)
+colorBoS       = input.color(color.new(#2962FF, 0), "BoS", group=grp_color)
+colorChoCh     = input.color(color.new(#FF6D00, 0), "ChoCh", group=grp_color)
+colorDiscount  = input.color(color.new(#089981, 85), "Vùng Discount (Buy)", group=grp_color)
+colorPremium   = input.color(color.new(#F23645, 85), "Vùng Premium (Sell)", group=grp_color)
+
+// ══════════════════════════════════════════
+// TRẠNG THÁI
+// ══════════════════════════════════════════
+var int trend = 0
+
+var float lastSH    = na
+var int   lastSHBar = na
+var float prevSH    = na
+var int   prevSHBar = na
+
+var float lastSL    = na
+var int   lastSLBar = na
+var float prevSL    = na
+var int   prevSLBar = na
+
+// Phá vỡ + chờ pullback
+var bool  waitPullbackUp      = false
+var float brokenUpLevel       = na
+var int   brokenUpBar         = na
+var float peakAfterBreakUp    = na
+var int   peakAfterBreakUpBar = na
+var bool  isChochUp           = false
+
+var bool  waitPullbackDn         = false
+var float brokenDnLevel          = na
+var int   brokenDnBar            = na
+var float troughAfterBreakDn     = na
+var int   troughAfterBreakDnBar  = na
+var bool  isChochDn              = false
+
+// Tracking cực trị
+var float lowestBetweenSH     = na
+var int   lowestBetweenSHBar  = na
+var float highestBetweenSL    = na
+var int   highestBetweenSLBar = na
+
+var bool skipAutoSH = false
+var bool skipAutoSL = false
+
+// Flags vẽ
+var bool  drawBosUp   = false
+var bool  drawBosDn   = false
+var bool  drawChochUp = false
+var bool  drawChochDn = false
+var float drawLineLevel = na
+var int   drawLineBar   = na
+
+// ═══════════════════════════════════════════
+// STEP 2: TRADE QUALITY
+// ═══════════════════════════════════════════
+var float swingHigh_fib = na
+var float swingLow_fib  = na
+var int   fibStartBar   = na
+
+var float eq50          = na
+var float discountLevel = na
+var float premiumLevel  = na
+
+var bool inDiscountZone = false
+var bool inPremiumZone  = false
+
+var box fibBox = na
+
+// ═══════════════════════════════════════════
+// STEP 3: ENTRY SIGNAL (V2 - STRICT)
+// ═══════════════════════════════════════════
+var bool buySignal  = false
+var bool sellSignal = false
+
+// Tracking: Đã vào vùng chưa
+var bool hasEnteredDiscount = false
+var bool hasEnteredPremium  = false
+
+// Tracking: Setup còn valid không (nếu miss nến đầu → invalid)
+var bool setupBuyValid  = true
+var bool setupSellValid = true
+
+// Tracking: Swing mới đã được xác nhận chưa (sau ChoCh cần có pullback)
+var bool newSwingConfirmed = false
+
+// Tracking: Đã check nến xác nhận đầu tiên chưa
+var bool checkedFirstBuy  = false
+var bool checkedFirstSell = false
+
+// Tracking: Số trigger
+var int buyTriggerCount  = 0
+var int sellTriggerCount = 0
+
+// Tracking: ĐÁY/ĐỈNH DỰ ĐOÁN (predicted) = cực trị trước nến confirm đầu tiên
+var float predictedLow  = na
+var float predictedHigh = na
+
+// Tracking: Đáy/Đỉnh hiện tại khi trong vùng (để tìm predicted)
+var float currentLowInDiscount  = na
+var float currentHighInPremium  = na
+
+// ══════════════════════════════════════════
+// EMA 200
+// ══════════════════════════════════════════
+ema200 = ta.ema(close, emaLen)
+
+// ══════════════════════════════════════════
+// NẾN XÁC NHẬN
+// ══════════════════════════════════════════
+isConfirmHigh = close < low[1]
+isConfirmLow  = close > high[1]
+
+// ══════════════════════════════════════════
+// TRACKING CỰC TRỊ (mỗi bar)
+// ══════════════════════════════════════════
+if trend >= 0
+    if na(lowestBetweenSH) or low < lowestBetweenSH
+        lowestBetweenSH    := low
+        lowestBetweenSHBar := bar_index
+
+if trend <= 0
+    if na(highestBetweenSL) or high > highestBetweenSL
+        highestBetweenSL    := high
+        highestBetweenSLBar := bar_index
+
+// ══════════════════════════════════════════
+// UPTREND LOGIC
+// ══════════════════════════════════════════
+if trend >= 0
+    // ── Phá đỉnh ──
+    if not waitPullbackUp and not na(lastSH)
+        if close > lastSH
+            waitPullbackUp      := true
+            brokenUpLevel       := lastSH
+            brokenUpBar         := lastSHBar
+            peakAfterBreakUp    := high
+            peakAfterBreakUpBar := bar_index
+            isChochUp           := false
+
+    // ── Chờ pullback xác nhận SH ──
+    if waitPullbackUp
+        if high > peakAfterBreakUp
+            peakAfterBreakUp    := high
+            peakAfterBreakUpBar := bar_index
+
+        if isConfirmHigh
+            waitPullbackUp := false
+
+            // SH cũ → prev
+            prevSH    := lastSH
+            prevSHBar := lastSHBar
+
+            // SH mới = peak sau breakout (luôn gán)
+            lastSH    := peakAfterBreakUp
+            lastSHBar := peakAfterBreakUpBar
+
+            // SL tự động = lowest giữa 2 SH
+            if skipAutoSL
+                skipAutoSL := false
+            else
+                prevSL    := lastSL
+                prevSLBar := lastSLBar
+                lastSL    := lowestBetweenSH
+                lastSLBar := lowestBetweenSHBar
+
+                // Vẽ SL
+                if showSwingHL and not na(lastSL)
+                    label.new(lastSLBar, lastSL, "SL", style=label.style_label_up, color=color.new(colorSL, 70), textcolor=colorSL, size=size.tiny)
+
+            // Vẽ SH (luôn vẽ)
+            if showSwingHL
+                label.new(lastSHBar, lastSH, "SH", style=label.style_label_down, color=color.new(colorSH, 70), textcolor=colorSH, size=size.tiny)
+
+            if showConfirm
+                label.new(bar_index, high, "✓", style=label.style_label_down, color=color.new(colorSH, 85), textcolor=colorSH, size=size.tiny)
+
+            if isChochUp
+                drawChochUp := true
+            else
+                drawBosUp := true
+            drawLineLevel := brokenUpLevel
+            drawLineBar   := brokenUpBar
+            trend := 1
+
+            // ═══ STEP 2: Cập nhật Fib levels cho UPTREND ═══
+            swingHigh_fib := lastSH
+            swingLow_fib  := lastSL
+            fibStartBar   := bar_index
+            
+            // Tính levels
+            float swingRange = swingHigh_fib - swingLow_fib
+            eq50          := swingLow_fib + (swingRange * 0.5)
+            discountLevel := swingLow_fib + (swingRange * (fibThreshold / 100.0))
+            premiumLevel  := na  // Uptrend không cần premium
+
+            // ═══ STEP 3: Reset tracking cho sóng mới ═══
+            hasEnteredDiscount      := false
+            setupBuyValid           := true
+            checkedFirstBuy         := false
+            buyTriggerCount         := 0
+            predictedLow            := na
+            currentLowInDiscount    := na
+            newSwingConfirmed       := true  // Swing mới đã xác nhận
+
+            // Reset tracking
+            lowestBetweenSH    := low
+            lowestBetweenSHBar := bar_index
+
+    // ── ChoCh DOWN: phá SL trong uptrend ──
+    if not waitPullbackDn and not na(lastSL) and trend == 1
+        if close < lastSL
+            waitPullbackDn        := true
+            brokenDnLevel         := lastSL
+            brokenDnBar           := lastSLBar
+            troughAfterBreakDn    := low
+            troughAfterBreakDnBar := bar_index
+            isChochDn             := true
+            skipAutoSH            := true
+
+            waitPullbackUp := false
+            trend := -1
+            
+            // ═══ STEP 3: ChoCh → Reset toàn bộ tracking ═══
+            newSwingConfirmed       := false
+            hasEnteredPremium       := false
+            setupSellValid          := true
+            checkedFirstSell        := false
+            sellTriggerCount        := 0
+            predictedHigh           := na
+            currentHighInPremium    := na
+            
+            // Reset BUY tracking (quan trọng!)
+            hasEnteredDiscount      := false
+            setupBuyValid           := true
+            checkedFirstBuy         := false
+            buyTriggerCount         := 0
+            predictedLow            := na
+            currentLowInDiscount    := na
+
+            highestBetweenSL    := high
+            highestBetweenSLBar := bar_index
+
+// ══════════════════════════════════════════
+// DOWNTREND LOGIC
+// ══════════════════════════════════════════
+if trend == -1
+    // ── Phá đáy ──
+    if not waitPullbackDn and not na(lastSL)
+        if close < lastSL
+            waitPullbackDn        := true
+            brokenDnLevel         := lastSL
+            brokenDnBar           := lastSLBar
+            troughAfterBreakDn    := low
+            troughAfterBreakDnBar := bar_index
+            isChochDn             := false
+
+    // ── Chờ pullback xác nhận SL ──
+    if waitPullbackDn
+        if low < troughAfterBreakDn
+            troughAfterBreakDn    := low
+            troughAfterBreakDnBar := bar_index
+
+        if isConfirmLow
+            waitPullbackDn := false
+
+            // SL cũ → prev
+            prevSL    := lastSL
+            prevSLBar := lastSLBar
+
+            // SL mới = trough sau breakout (luôn gán)
+            lastSL    := troughAfterBreakDn
+            lastSLBar := troughAfterBreakDnBar
+
+            // SH tự động = highest giữa 2 SL
+            if skipAutoSH
+                skipAutoSH := false
+            else
+                prevSH    := lastSH
+                prevSHBar := lastSHBar
+                lastSH    := highestBetweenSL
+                lastSHBar := highestBetweenSLBar
+
+                // Vẽ SH
+                if showSwingHL and not na(lastSH)
+                    label.new(lastSHBar, lastSH, "SH", style=label.style_label_down, color=color.new(colorSH, 70), textcolor=colorSH, size=size.tiny)
+
+            // Vẽ SL (luôn vẽ)
+            if showSwingHL
+                label.new(lastSLBar, lastSL, "SL", style=label.style_label_up, color=color.new(colorSL, 70), textcolor=colorSL, size=size.tiny)
+
+            if showConfirm
+                label.new(bar_index, low, "✓", style=label.style_label_up, color=color.new(colorSL, 85), textcolor=colorSL, size=size.tiny)
+
+            if isChochDn
+                drawChochDn := true
+            else
+                drawBosDn := true
+            drawLineLevel := brokenDnLevel
+            drawLineBar   := brokenDnBar
+            trend := -1
+
+            // ═══ STEP 2: Cập nhật Fib levels cho DOWNTREND ═══
+            swingHigh_fib := lastSH
+            swingLow_fib  := lastSL
+            fibStartBar   := bar_index
+            
+            // Tính levels
+            float swingRange = swingHigh_fib - swingLow_fib
+            eq50          := swingLow_fib + (swingRange * 0.5)
+            premiumLevel  := swingHigh_fib - (swingRange * (fibThreshold / 100.0))
+            discountLevel := na  // Downtrend không cần discount
+
+            // ═══ STEP 3: Reset tracking cho sóng mới ═══
+            hasEnteredPremium       := false
+            setupSellValid          := true
+            checkedFirstSell        := false
+            sellTriggerCount        := 0
+            predictedHigh           := na
+            currentHighInPremium    := na
+            newSwingConfirmed       := true  // Swing mới đã xác nhận
+
+            // Reset tracking
+            highestBetweenSL    := high
+            highestBetweenSLBar := bar_index
+
+    // ── ChoCh UP: phá SH trong downtrend ──
+    if not waitPullbackUp and not na(lastSH) and trend == -1
+        if close > lastSH
+            waitPullbackUp      := true
+            brokenUpLevel       := lastSH
+            brokenUpBar         := lastSHBar
+            peakAfterBreakUp    := high
+            peakAfterBreakUpBar := bar_index
+            isChochUp           := true
+            skipAutoSL          := true
+
+            waitPullbackDn := false
+            trend := 1
+            
+            // ═══ STEP 3: ChoCh → Reset toàn bộ tracking ═══
+            newSwingConfirmed       := false
+            hasEnteredDiscount      := false
+            setupBuyValid           := true
+            checkedFirstBuy         := false
+            buyTriggerCount         := 0
+            predictedLow            := na
+            currentLowInDiscount    := na
+            
+            // Reset SELL tracking (quan trọng!)
+            hasEnteredPremium       := false
+            setupSellValid          := true
+            checkedFirstSell        := false
+            sellTriggerCount        := 0
+            predictedHigh           := na
+            currentHighInPremium    := na
+
+            lowestBetweenSH    := low
+            lowestBetweenSHBar := bar_index
+
+// ══════════════════════════════════════════
+// INIT
+// ══════════════════════════════════════════
+if trend == 0
+    pivotH = ta.pivothigh(high, swingLen, swingLen)
+    pivotL = ta.pivotlow(low, swingLen, swingLen)
+
+    if not na(pivotH)
+        if na(lastSH) or pivotH > lastSH
+            prevSH    := lastSH
+            prevSHBar := lastSHBar
+            lastSH    := pivotH
+            lastSHBar := bar_index - swingLen
+            if showSwingHL
+                label.new(lastSHBar, lastSH, "SH", style=label.style_label_down, color=color.new(color.gray, 70), textcolor=color.gray, size=size.tiny)
+
+    if not na(pivotL)
+        if na(lastSL) or pivotL < lastSL
+            prevSL    := lastSL
+            prevSLBar := lastSLBar
+            lastSL    := pivotL
+            lastSLBar := bar_index - swingLen
+            if showSwingHL
+                label.new(lastSLBar, lastSL, "SL", style=label.style_label_up, color=color.new(color.gray, 70), textcolor=color.gray, size=size.tiny)
+
+    if not na(lastSH) and not na(lastSL)
+        if not na(prevSH) and lastSH > prevSH
+            trend := 1
+            lowestBetweenSH    := low
+            lowestBetweenSHBar := bar_index
+        else if not na(prevSL) and lastSL < prevSL
+            trend := -1
+            highestBetweenSL    := high
+            highestBetweenSLBar := bar_index
+
+// ══════════════════════════════════════════
+// VẼ BOS / CHOCH
+// ══════════════════════════════════════════
+if showBosChoch and not na(drawLineBar)
+    midBar = math.round(math.avg(drawLineBar, bar_index))
+
+    if drawBosUp
+        line.new(drawLineBar, drawLineLevel, bar_index, drawLineLevel, color=colorBoS, style=line.style_dashed, width=1)
+        label.new(midBar, drawLineLevel, "BoS ↑", color=color.new(color.black, 100), textcolor=colorBoS, style=label.style_none, size=size.small)
+
+    if drawBosDn
+        line.new(drawLineBar, drawLineLevel, bar_index, drawLineLevel, color=colorBoS, style=line.style_dashed, width=1)
+        label.new(midBar, drawLineLevel, "BoS ↓", color=color.new(color.black, 100), textcolor=colorBoS, style=label.style_none, size=size.small)
+
+    if drawChochUp
+        line.new(drawLineBar, drawLineLevel, bar_index, drawLineLevel, color=colorChoCh, style=line.style_dotted, width=2)
+        label.new(midBar, drawLineLevel, "ChoCh ↑", color=color.new(color.black, 100), textcolor=colorChoCh, style=label.style_none, size=size.small)
+
+    if drawChochDn
+        line.new(drawLineBar, drawLineLevel, bar_index, drawLineLevel, color=colorChoCh, style=line.style_dotted, width=2)
+        label.new(midBar, drawLineLevel, "ChoCh ↓", color=color.new(color.black, 100), textcolor=colorChoCh, style=label.style_none, size=size.small)
+
+drawBosUp     := false
+drawBosDn     := false
+drawChochUp   := false
+drawChochDn   := false
+drawLineLevel := na
+drawLineBar   := na
+
+// ══════════════════════════════════════════
+// STEP 2: VẼ VÙNG DISCOUNT / PREMIUM
+// ══════════════════════════════════════════
+box.delete(fibBox)
+
+// ═══ STEP 3: TRACKING VÀO VÙNG (độc lập với việc vẽ box) ═══
+if trend == 1 and not na(discountLevel)
+    // UPTREND: Kiểm tra giá có VÀO vùng Discount không
+    // Dùng LOW để bắt cả trường hợp sweep (đầu nến chạm Discount rồi close lại ngoài)
+    inDiscountZone := low <= discountLevel
+    inPremiumZone  := false
+    
+    // Tracking đã vào Discount chưa
+    if inDiscountZone and not hasEnteredDiscount
+        hasEnteredDiscount := true
+        currentLowInDiscount := low
+    
+    // Cập nhật currentLow khi đang trong vùng Discount (trước nến confirm đầu)
+    if inDiscountZone and not checkedFirstBuy
+        if na(currentLowInDiscount) or low < currentLowInDiscount
+            currentLowInDiscount := low
+
+else if trend == -1 and not na(premiumLevel)
+    // DOWNTREND: Kiểm tra giá có VÀO vùng Premium không
+    // Dùng HIGH để bắt cả trường hợp sweep (đầu nến chạm Premium rồi close lại ngoài)
+    inPremiumZone  := high >= premiumLevel
+    inDiscountZone := false
+    
+    // Tracking đã vào Premium chưa
+    if inPremiumZone and not hasEnteredPremium
+        hasEnteredPremium := true
+        currentHighInPremium := high
+    
+    // Cập nhật currentHigh khi đang trong vùng Premium (trước nến confirm đầu)
+    if inPremiumZone and not checkedFirstSell
+        if na(currentHighInPremium) or high > currentHighInPremium
+            currentHighInPremium := high
+
+// ═══ VẼ BOX (tùy chọn) ═══
+if showFibZone and not na(swingHigh_fib) and not na(swingLow_fib)
+    if trend == 1 and not na(discountLevel)
+        // UPTREND: Vẽ vùng Discount (từ 50% → 100% = SL)
+        fibBox := box.new(fibStartBar, discountLevel, bar_index + 10, swingLow_fib, 
+                          border_color=color.new(colorDiscount, 100), 
+                          bgcolor=colorDiscount,
+                          text="Discount ≥" + str.tostring(fibThreshold, "#") + "%",
+                          text_color=colorSH,
+                          text_size=size.tiny,
+                          text_halign=text.align_right,
+                          text_valign=text.align_top)
+        
+    else if trend == -1 and not na(premiumLevel)
+        // DOWNTREND: Vẽ vùng Premium (từ 0% = SH → 50%)
+        fibBox := box.new(fibStartBar, swingHigh_fib, bar_index + 10, premiumLevel,
+                          border_color=color.new(colorPremium, 100),
+                          bgcolor=colorPremium,
+                          text="Premium ≥" + str.tostring(fibThreshold, "#") + "%",
+                          text_color=colorSL,
+                          text_size=size.tiny,
+                          text_halign=text.align_right,
+                          text_valign=text.align_bottom)
+
+// ══════════════════════════════════════════
+// VẼ ĐƯỜNG EQUILIBRIUM (50%)
+// ══════════════════════════════════════════
+var line eqLine = na
+if showEQ and not na(eq50)
+    line.delete(eqLine)
+    eqLine := line.new(fibStartBar, eq50, bar_index + 10, eq50, 
+                       color=color.new(color.gray, 50), 
+                       style=line.style_dotted, 
+                       width=1)
+    if barstate.islast
+        label.new(bar_index + 5, eq50, "EQ 50%", 
+                  style=label.style_none, 
+                  color=color.new(color.black, 100), 
+                  textcolor=color.gray, 
+                  size=size.tiny)
+
+// ══════════════════════════════════════════
+// STEP 3: ENTRY SIGNAL LOGIC (V2 - STRICT)
+// ══════════════════════════════════════════
+buySignal  := false
+sellSignal := false
+
+// ═════ BUY LOGIC (STRICT) ═════
+// Điều kiện thêm: newSwingConfirmed = true (đã có pullback xác nhận swing mới)
+if trend == 1 and newSwingConfirmed and setupBuyValid and hasEnteredDiscount
+    
+    // Kiểm tra nến xác nhận đầu tiên
+    if not checkedFirstBuy and isConfirmLow
+        checkedFirstBuy := true
+        
+        // Lưu đáy dự đoán = đáy thấp nhất trước nến confirm này
+        predictedLow := currentLowInDiscount
+        
+        // Điều kiện: Close > EMA200
+        if close > ema200
+            // ✓ Trigger lần 1 thành công
+            buySignal := true
+            buyTriggerCount := 1
+            
+            if enableAlerts
+                alert("🟢 BUY #1 | Price: " + str.tostring(close, "#.##") + " | EMA200: " + str.tostring(ema200, "#.##") + " | Predicted Low: " + str.tostring(predictedLow, "#.##"), alert.freq_once_per_bar_close)
+        else
+            // ✗ Miss nến đầu → BỎ QUA setup sóng này
+            setupBuyValid := false
+    
+    // Trigger lần 2: Phải có đáy mới thấp hơn PREDICTED LOW (đáy dự đoán)
+    else if buyTriggerCount == 1 and isConfirmLow
+        // Điều kiện: Đáy mới < predicted low (sweep đáy dự đoán) + Close > EMA200
+        if not na(predictedLow) and low < predictedLow and close > ema200
+            buySignal := true
+            buyTriggerCount := 2
+            
+            if enableAlerts
+                alert("🟢 BUY #2 (Sweep Predicted) | Price: " + str.tostring(close, "#.##") + " | Swept: " + str.tostring(predictedLow, "#.##") + " → " + str.tostring(low, "#.##"), alert.freq_once_per_bar_close)
+
+// ═════ SELL LOGIC (STRICT) ═════
+// Điều kiện thêm: newSwingConfirmed = true (đã có pullback xác nhận swing mới)
+if trend == -1 and newSwingConfirmed and setupSellValid and hasEnteredPremium
+    
+    // Kiểm tra nến xác nhận đầu tiên
+    if not checkedFirstSell and isConfirmHigh
+        checkedFirstSell := true
+        
+        // Lưu đỉnh dự đoán = đỉnh cao nhất trước nến confirm này
+        predictedHigh := currentHighInPremium
+        
+        // Điều kiện: Close < EMA200
+        if close < ema200
+            // ✓ Trigger lần 1 thành công
+            sellSignal := true
+            sellTriggerCount := 1
+            
+            if enableAlerts
+                alert("🔴 SELL #1 | Price: " + str.tostring(close, "#.##") + " | EMA200: " + str.tostring(ema200, "#.##") + " | Predicted High: " + str.tostring(predictedHigh, "#.##"), alert.freq_once_per_bar_close)
+        else
+            // ✗ Miss nến đầu → BỎ QUA setup sóng này
+            setupSellValid := false
+    
+    // Trigger lần 2: Phải có đỉnh mới cao hơn PREDICTED HIGH (đỉnh dự đoán)
+    else if sellTriggerCount == 1 and isConfirmHigh
+        // Điều kiện: Đỉnh mới > predicted high (sweep đỉnh dự đoán) + Close < EMA200
+        if not na(predictedHigh) and high > predictedHigh and close < ema200
+            sellSignal := true
+            sellTriggerCount := 2
+            
+            if enableAlerts
+                alert("🔴 SELL #2 (Sweep Predicted) | Price: " + str.tostring(close, "#.##") + " | Swept: " + str.tostring(predictedHigh, "#.##") + " → " + str.tostring(high, "#.##"), alert.freq_once_per_bar_close)
+
+// ══════════════════════════════════════════
+// ĐƯỜNG MỨC CHỜ PHÁ VỠ
+// ══════════════════════════════════════════
+var line levelHighLine = na
+var line levelLowLine  = na
+
+if showLevels
+    line.delete(levelHighLine)
+    line.delete(levelLowLine)
+
+    if not na(lastSH)
+        levelHighLine := line.new(lastSHBar, lastSH, bar_index + 5, lastSH, color=color.new(colorSH, 60), style=line.style_dotted, width=1)
+    if not na(lastSL)
+        levelLowLine := line.new(lastSLBar, lastSL, bar_index + 5, lastSL, color=color.new(colorSL, 60), style=line.style_dotted, width=1)
+
+// ══════════════════════════════════════════
+// BẢNG TRẠNG THÁI
+// ══════════════════════════════════════════
+var table tbl = table.new(position.top_right, 2, 10, bgcolor=color.new(color.black, 85), border_width=1, border_color=color.new(color.white, 80))
+
+if barstate.islast
+    trendStr = trend == 1 ? "🟢 BULLISH" : trend == -1 ? "🔴 BEARISH" : "⚪ INIT"
+    shStr    = not na(lastSH) ? str.tostring(lastSH, "#.##") : "—"
+    slStr    = not na(lastSL) ? str.tostring(lastSL, "#.##") : "—"
+
+    table.cell(tbl, 0, 0, "STEP 3 v2", text_color=color.white, text_size=size.small)
+    table.cell(tbl, 1, 0, "FIXED SWEEP", text_color=color.yellow, text_size=size.small)
+
+    table.cell(tbl, 0, 1, "Trend", text_color=color.gray, text_size=size.tiny)
+    table.cell(tbl, 1, 1, trendStr, text_color=color.white, text_size=size.tiny)
+
+    table.cell(tbl, 0, 2, "Swing High", text_color=color.gray, text_size=size.tiny)
+    table.cell(tbl, 1, 2, shStr, text_color=colorSH, text_size=size.tiny)
+
+    table.cell(tbl, 0, 3, "Swing Low", text_color=color.gray, text_size=size.tiny)
+    table.cell(tbl, 1, 3, slStr, text_color=colorSL, text_size=size.tiny)
+
+    table.cell(tbl, 0, 4, "EMA 200", text_color=color.gray, text_size=size.tiny)
+    emaStr = str.tostring(ema200, "#.##")
+    emaStatusColor = close > ema200 ? colorSH : close < ema200 ? colorSL : color.gray
+    table.cell(tbl, 1, 4, emaStr, text_color=emaStatusColor, text_size=size.tiny)
+
+    table.cell(tbl, 0, 5, "EQ 50%", text_color=color.gray, text_size=size.tiny)
+    eqStr = not na(eq50) ? str.tostring(eq50, "#.##") : "—"
+    table.cell(tbl, 1, 5, eqStr, text_color=color.gray, text_size=size.tiny)
+
+    table.cell(tbl, 0, 6, "Setup Valid", text_color=color.gray, text_size=size.tiny)
+    setupStr = ""
+    setupColor = color.white
+    if trend == 1
+        if not newSwingConfirmed
+            setupStr := "⏳ Chờ pullback xác nhận"
+            setupColor := color.orange
+        else if not setupBuyValid
+            setupStr := "🚫 Bỏ qua (miss 1st)"
+            setupColor := color.red
+        else if hasEnteredDiscount
+            setupStr := "✓ Valid"
+            setupColor := color.lime
+        else
+            setupStr := "⏳ Chờ vào Discount"
+            setupColor := color.orange
+    else if trend == -1
+        if not newSwingConfirmed
+            setupStr := "⏳ Chờ pullback xác nhận"
+            setupColor := color.orange
+        else if not setupSellValid
+            setupStr := "🚫 Bỏ qua (miss 1st)"
+            setupColor := color.red
+        else if hasEnteredPremium
+            setupStr := "✓ Valid"
+            setupColor := color.lime
+        else
+            setupStr := "⏳ Chờ vào Premium"
+            setupColor := color.orange
+    else
+        setupStr := "—"
+        setupColor := color.gray
+    table.cell(tbl, 1, 6, setupStr, text_color=setupColor, text_size=size.tiny)
+
+    table.cell(tbl, 0, 7, "Trigger", text_color=color.gray, text_size=size.tiny)
+    triggerStr = ""
+    triggerColor = color.white
+    if trend == 1
+        if buyTriggerCount == 0
+            triggerStr := "0/2 BUY"
+        else if buyTriggerCount == 1
+            triggerStr := "1/2 BUY (chờ sweep)"
+            triggerColor := color.yellow
+        else
+            triggerStr := "2/2 BUY (hết)"
+            triggerColor := color.red
+    else if trend == -1
+        if sellTriggerCount == 0
+            triggerStr := "0/2 SELL"
+        else if sellTriggerCount == 1
+            triggerStr := "1/2 SELL (chờ sweep)"
+            triggerColor := color.yellow
+        else
+            triggerStr := "2/2 SELL (hết)"
+            triggerColor := color.red
+    else
+        triggerStr := "—"
+        triggerColor := color.gray
+    table.cell(tbl, 1, 7, triggerStr, text_color=triggerColor, text_size=size.tiny)
+
+    table.cell(tbl, 0, 8, "Entry Ready", text_color=color.gray, text_size=size.tiny)
+    entryStr = ""
+    entryColor = color.orange
+    if trend == 1
+        if not setupBuyValid
+            entryStr := "✗ Setup invalid"
+            entryColor := color.red
+        else if buyTriggerCount >= 2
+            entryStr := "✗ Hết quota"
+            entryColor := color.red
+        else if buyTriggerCount == 1
+            entryStr := "⏳ Chờ sweep đáy"
+            entryColor := color.yellow
+        else if hasEnteredDiscount and close > ema200
+            entryStr := "✓ Chờ nến confirm"
+            entryColor := color.lime
+        else if hasEnteredDiscount
+            entryStr := "⚠ Close <= EMA200"
+        else
+            entryStr := "⏳ Chờ vào Discount"
+    else if trend == -1
+        if not setupSellValid
+            entryStr := "✗ Setup invalid"
+            entryColor := color.red
+        else if sellTriggerCount >= 2
+            entryStr := "✗ Hết quota"
+            entryColor := color.red
+        else if sellTriggerCount == 1
+            entryStr := "⏳ Chờ sweep đỉnh"
+            entryColor := color.yellow
+        else if hasEnteredPremium and close < ema200
+            entryStr := "✓ Chờ nến confirm"
+            entryColor := color.lime
+        else if hasEnteredPremium
+            entryStr := "⚠ Close >= EMA200"
+        else
+            entryStr := "⏳ Chờ vào Premium"
+    else
+        entryStr := "—"
+    table.cell(tbl, 1, 8, entryStr, text_color=entryColor, text_size=size.tiny)
+
+    table.cell(tbl, 0, 9, "Trạng thái", text_color=color.gray, text_size=size.tiny)
+    stateStr = ""
+    if waitPullbackUp
+        stateStr := "Phá đỉnh → chờ pullback ✓"
+    else if waitPullbackDn
+        stateStr := "Phá đáy → chờ pullback ✓"
+    else
+        stateStr := "Chờ phá vỡ"
+    table.cell(tbl, 1, 9, stateStr, text_color=color.orange, text_size=size.tiny)
+
+// ══════════════════════════════════════════
+// EMA 200
+// ══════════════════════════════════════════
+plot(ema200, "EMA 200", color=emaColor, linewidth=2)
+
+// ══════════════════════════════════════════
+bgcolor(trend == 1 ? color.new(colorSH, 95) : trend == -1 ? color.new(colorSL, 95) : na)
+
+// ══════════════════════════════════════════
+// PLOT SIGNALS
+// ══════════════════════════════════════════
+plotshape(buySignal and showEntrySignal, "Buy Signal", shape.triangleup, location.belowbar, color.new(#2962FF, 0), size=size.small)
+plotshape(sellSignal and showEntrySignal, "Sell Signal", shape.triangledown, location.abovebar, color.new(#FF6D00, 0), size=size.small)
