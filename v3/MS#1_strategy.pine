@@ -10,7 +10,12 @@
 //         giữa 2 swing points, không phụ thuộc vào thời điểm reset
 
 //@version=6
-indicator("Market Structure - v3", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=100)
+strategy("Market Structure - MS#1 v3", overlay=true,
+         initial_capital=100000,
+         commission_type=strategy.commission.percent,
+         commission_value=0.05,
+         pyramiding=10,
+         max_lines_count=500, max_labels_count=500, max_boxes_count=100)
 
 // ════════════════════════════════════════════════════════════
 // ① INPUTS
@@ -44,8 +49,11 @@ showEQ        = input.bool(true,  "Hiện đường Equilibrium (50%)",         
 grp_entry = "═══ STEP 3 · ENTRY SIGNAL ═══"
 showEntrySignal = input.bool(true,  "Hiện tín hiệu Entry", group=grp_entry)
 enableAlerts    = input.bool(true,  "Bật Alert",           group=grp_entry)
-colorBuy        = input.color(color.new(#00897B, 0), "Màu BUY",  group=grp_entry)
-colorSell       = input.color(color.new(#E53935, 0), "Màu SELL", group=grp_entry)
+colorBuy        = input.color(color.new(#00897B, 0), "Màu BUY",       group=grp_entry)
+colorSell       = input.color(color.new(#E53935, 0), "Màu SELL",      group=grp_entry)
+spreadPts       = input.float(0.0,   "Spread (điểm)", minval=0, step=0.01, group=grp_entry)
+rrRatio         = input.float(1.5,   "R:R Ratio",     minval=0.5, maxval=10, step=0.1, group=grp_entry)
+riskUSD         = input.float(200.0, "Rủi ro (USD)",  minval=1, step=10, group=grp_entry)
 
 // ════════════════════════════════════════════════════════════
 // ② STATE VARIABLES
@@ -140,6 +148,16 @@ var bool sweepOccurredSell = false
 // Cực trị trong quá trình sweep (dùng làm SL mới cho #2)
 var float sweepLowBuy   = na
 var float sweepHighSell = na
+
+// Theo dõi kết quả #1 để quyết định có vào #2 không
+var float buy1SLPrice  = na
+var float buy1TPPrice  = na
+var bool  buy1HitSL    = false
+var bool  buy1HitTP    = false
+var float sell1SLPrice = na
+var float sell1TPPrice = na
+var bool  sell1HitSL   = false
+var bool  sell1HitTP   = false
 
 // ════════════════════════════════════════════════════════════
 // ③ HELPER FUNCTIONS
@@ -260,6 +278,10 @@ if trend >= 0
             currentLowInDiscount := na
             sweepOccurredBuy     := false
             sweepLowBuy          := na
+            buy1SLPrice          := na
+            buy1TPPrice          := na
+            buy1HitSL            := false
+            buy1HitTP            := false
             newSwingConfirmed    := true
 
     // ChoCh DOWN: phá SL trong uptrend → đổi về downtrend
@@ -285,6 +307,10 @@ if trend >= 0
             currentHighInPremium := na
             sweepOccurredSell    := false
             sweepHighSell        := na
+            sell1SLPrice         := na
+            sell1TPPrice         := na
+            sell1HitSL           := false
+            sell1HitTP           := false
 
             hasEnteredDiscount   := false
             setupBuyValid        := true
@@ -294,6 +320,10 @@ if trend >= 0
             currentLowInDiscount := na
             sweepOccurredBuy     := false
             sweepLowBuy          := na
+            buy1SLPrice          := na
+            buy1TPPrice          := na
+            buy1HitSL            := false
+            buy1HitTP            := false
 
 // ── DOWNTREND: Phá đáy / ChoCh lên ──────────────────────────
 if trend == -1
@@ -365,6 +395,10 @@ if trend == -1
             currentHighInPremium := na
             sweepOccurredSell    := false
             sweepHighSell        := na
+            sell1SLPrice         := na
+            sell1TPPrice         := na
+            sell1HitSL           := false
+            sell1HitTP           := false
             newSwingConfirmed    := true
 
     // ChoCh UP: phá SH trong downtrend → đổi về uptrend
@@ -390,6 +424,10 @@ if trend == -1
             currentLowInDiscount := na
             sweepOccurredBuy     := false
             sweepLowBuy          := na
+            buy1SLPrice          := na
+            buy1TPPrice          := na
+            buy1HitSL            := false
+            buy1HitTP            := false
 
             hasEnteredPremium    := false
             setupSellValid       := true
@@ -399,6 +437,10 @@ if trend == -1
             currentHighInPremium := na
             sweepOccurredSell    := false
             sweepHighSell        := na
+            sell1SLPrice         := na
+            sell1TPPrice         := na
+            sell1HitSL           := false
+            sell1HitTP           := false
 
 // ── INIT: Xác định trend ban đầu (chạy khi trend == 0) ───────
 // QUAN TRỌNG: giữ sau uptrend/downtrend để đảm bảo thứ tự thực thi đúng
@@ -460,6 +502,23 @@ else if trend == -1 and not na(premiumLevel)
             currentHighInPremium := high
 
 // ════════════════════════════════════════════════════════════
+// THEO DÕI KẾT QUẢ #1 (để quyết định vào #2)
+// SL hit trước → loss → cho phép #2
+// TP hit trước → win → chặn #2
+// ════════════════════════════════════════════════════════════
+if buyTriggerCount == 1 and not buy1HitSL and not buy1HitTP
+    if not na(buy1SLPrice) and low  <= buy1SLPrice
+        buy1HitSL := true
+    if not na(buy1TPPrice) and high >= buy1TPPrice
+        buy1HitTP := true
+
+if sellTriggerCount == 1 and not sell1HitSL and not sell1HitTP
+    if not na(sell1SLPrice) and high >= sell1SLPrice
+        sell1HitSL := true
+    if not na(sell1TPPrice) and low  <= sell1TPPrice
+        sell1HitTP := true
+
+// ════════════════════════════════════════════════════════════
 // ③ STEP 3: ENTRY SIGNAL LOGIC
 // ════════════════════════════════════════════════════════════
 
@@ -472,16 +531,25 @@ if trend == 1 and newSwingConfirmed and setupBuyValid and hasEnteredDiscount
         predictedLow    := currentLowInDiscount
 
         if close > ema200
+            float slBuy = predictedLow - spreadPts
+            float tpBuy = close + (close - slBuy) * rrRatio
+            buy1SLPrice     := slBuy
+            buy1TPPrice     := tpBuy
+            buy1HitSL       := false
+            buy1HitTP       := false
             buyTriggerCount := 1
+            string buyId1 = "B_" + str.tostring(bar_index)
+            strategy.entry(buyId1, strategy.long, qty=riskUSD / (close - slBuy))
+            strategy.exit(buyId1 + "x", from_entry=buyId1, stop=slBuy, limit=tpBuy)
             if showEntrySignal
                 label.new(bar_index, low, "#1", style=label.style_label_up, color=colorBuy, textcolor=color.white, size=size.small)
             if enableAlerts
-                alert("🟢 BUY #1 | Price: " + str.tostring(close, "#.##") + " | EMA200: " + str.tostring(ema200, "#.##") + " | Predicted Low: " + str.tostring(predictedLow, "#.##"), alert.freq_once_per_bar_close)
+                alert("🟢 BUY #1 | Price: " + str.tostring(close, "#.##") + " | SL: " + str.tostring(slBuy, "#.##") + " | TP: " + str.tostring(tpBuy, "#.##"), alert.freq_once_per_bar_close)
         else
             setupBuyValid := false
 
-    // Trigger #2: sweep qua predicted low + confirm đảo chiều (có thể cùng 1 nến)
-    else if buyTriggerCount == 1 and not na(predictedLow) and not waitPullbackUp
+    // Trigger #2: sweep qua predicted low + confirm đảo chiều — chỉ khi #1 đã hit SL
+    else if buyTriggerCount == 1 and buy1HitSL and not buy1HitTP and not na(predictedLow) and not waitPullbackUp
         if low < predictedLow
             sweepOccurredBuy := true
             sweepLowBuy      := na(sweepLowBuy) or low < sweepLowBuy ? low : sweepLowBuy
@@ -489,12 +557,17 @@ if trend == 1 and newSwingConfirmed and setupBuyValid and hasEnteredDiscount
             if close > ema200
                 buyTriggerCount  := 2
                 sweepOccurredBuy := false
-                predictedLow     := sweepLowBuy  // SL mới = đáy sweep
+                predictedLow     := sweepLowBuy
                 sweepLowBuy      := na
+                float slBuy2 = predictedLow - spreadPts
+                float tpBuy2 = close + (close - slBuy2) * rrRatio
+                string buyId2 = "B2_" + str.tostring(bar_index)
+                strategy.entry(buyId2, strategy.long, qty=riskUSD / (close - slBuy2))
+                strategy.exit(buyId2 + "x", from_entry=buyId2, stop=slBuy2, limit=tpBuy2)
                 if showEntrySignal
                     label.new(bar_index, low, "#2", style=label.style_label_up, color=colorBuy, textcolor=color.white, size=size.small)
                 if enableAlerts
-                    alert("🟢 BUY #2 (Sweep Confirm) | Price: " + str.tostring(close, "#.##") + " | Sweep Low: " + str.tostring(predictedLow, "#.##"), alert.freq_once_per_bar_close)
+                    alert("🟢 BUY #2 (Sweep) | Price: " + str.tostring(close, "#.##") + " | SL: " + str.tostring(slBuy2, "#.##") + " | TP: " + str.tostring(tpBuy2, "#.##"), alert.freq_once_per_bar_close)
 
 // ── SELL ─────────────────────────────────────────────────────
 if trend == -1 and newSwingConfirmed and setupSellValid and hasEnteredPremium
@@ -505,16 +578,25 @@ if trend == -1 and newSwingConfirmed and setupSellValid and hasEnteredPremium
         predictedHigh    := currentHighInPremium
 
         if close < ema200
+            float slSell = predictedHigh + spreadPts
+            float tpSell = close - (slSell - close) * rrRatio
+            sell1SLPrice     := slSell
+            sell1TPPrice     := tpSell
+            sell1HitSL       := false
+            sell1HitTP       := false
             sellTriggerCount := 1
+            string sellId1 = "S_" + str.tostring(bar_index)
+            strategy.entry(sellId1, strategy.short, qty=riskUSD / (slSell - close))
+            strategy.exit(sellId1 + "x", from_entry=sellId1, stop=slSell, limit=tpSell)
             if showEntrySignal
                 label.new(bar_index, high, "#1", style=label.style_label_down, color=colorSell, textcolor=color.white, size=size.small)
             if enableAlerts
-                alert("🔴 SELL #1 | Price: " + str.tostring(close, "#.##") + " | EMA200: " + str.tostring(ema200, "#.##") + " | Predicted High: " + str.tostring(predictedHigh, "#.##"), alert.freq_once_per_bar_close)
+                alert("🔴 SELL #1 | Price: " + str.tostring(close, "#.##") + " | SL: " + str.tostring(slSell, "#.##") + " | TP: " + str.tostring(tpSell, "#.##"), alert.freq_once_per_bar_close)
         else
             setupSellValid := false
 
-    // Trigger #2: sweep qua predicted high + confirm đảo chiều (có thể cùng 1 nến)
-    else if sellTriggerCount == 1 and not na(predictedHigh) and not waitPullbackDn
+    // Trigger #2: sweep qua predicted high + confirm đảo chiều — chỉ khi #1 đã hit SL
+    else if sellTriggerCount == 1 and sell1HitSL and not sell1HitTP and not na(predictedHigh) and not waitPullbackDn
         if high > predictedHigh
             sweepOccurredSell := true
             sweepHighSell     := na(sweepHighSell) or high > sweepHighSell ? high : sweepHighSell
@@ -522,12 +604,17 @@ if trend == -1 and newSwingConfirmed and setupSellValid and hasEnteredPremium
             if close < ema200
                 sellTriggerCount  := 2
                 sweepOccurredSell := false
-                predictedHigh     := sweepHighSell  // SL mới = đỉnh sweep
+                predictedHigh     := sweepHighSell
                 sweepHighSell     := na
+                float slSell2 = predictedHigh + spreadPts
+                float tpSell2 = close - (slSell2 - close) * rrRatio
+                string sellId2 = "S2_" + str.tostring(bar_index)
+                strategy.entry(sellId2, strategy.short, qty=riskUSD / (slSell2 - close))
+                strategy.exit(sellId2 + "x", from_entry=sellId2, stop=slSell2, limit=tpSell2)
                 if showEntrySignal
                     label.new(bar_index, high, "#2", style=label.style_label_down, color=colorSell, textcolor=color.white, size=size.small)
                 if enableAlerts
-                    alert("🔴 SELL #2 (Sweep Confirm) | Price: " + str.tostring(close, "#.##") + " | Sweep High: " + str.tostring(predictedHigh, "#.##"), alert.freq_once_per_bar_close)
+                    alert("🔴 SELL #2 (Sweep) | Price: " + str.tostring(close, "#.##") + " | SL: " + str.tostring(slSell2, "#.##") + " | TP: " + str.tostring(tpSell2, "#.##"), alert.freq_once_per_bar_close)
 
 // ════════════════════════════════════════════════════════════
 // DRAWING
